@@ -83,6 +83,20 @@ const accountSchema = new mongoose.Schema(
 
 module.exports = mongoose.model('Account', accountSchema);`;
 
+const ACCOUNT_AUTH = `const jwt = require('jsonwebtoken');
+
+module.exports = function auth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Missing token' });
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+};`;
+
 export type DemoProject = {
   id: string;
   label: string;
@@ -98,14 +112,15 @@ function f(id: string, name: string, role: CodeRole, content: string): CodeFile 
 export const DEMO_PROJECTS: DemoProject[] = [
   {
     id: "account-complete",
-    label: "Account API (complete: routes + controller + service + model)",
+    label: "Account API (complete: routes + controller + service + model + auth)",
     projectName: "account-api",
-    description: "Full tier-update flow: validation, service call, DB update, success/failure responses.",
+    description: "Full tier-update flow: auth, validation, service call, DB update, success/failure responses.",
     files: [
       f("demo-routes", "routes/accountRoutes.js", "route", ACCOUNT_ROUTES),
       f("demo-controller", "controllers/accountController.js", "controller", ACCOUNT_CONTROLLER),
       f("demo-service", "services/accountService.js", "service", ACCOUNT_SERVICE),
       f("demo-model", "models/Account.js", "model", ACCOUNT_MODEL),
+      f("demo-auth", "middleware/auth.js", "middleware", ACCOUNT_AUTH),
     ],
   },
   {

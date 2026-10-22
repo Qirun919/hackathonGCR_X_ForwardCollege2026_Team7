@@ -117,6 +117,7 @@ export default function GeneratePage() {
   const [markdown, setMarkdown] = useState("");
   const [completeness, setCompleteness] = useState<Completeness | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
+  const [blocked, setBlocked] = useState<{ reason: string; missing: string[]; requiredFiles: string[] } | null>(null);
   const [editMode, setEditMode] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -131,6 +132,7 @@ export default function GeneratePage() {
 
   function updateActive(patch: Partial<CodeFile>) {
     if (!active) return;
+    setBlocked(null);
     setFiles((prev) => prev.map((f) => (f.id === active.id ? { ...f, ...patch } : f)));
   }
 
@@ -228,7 +230,15 @@ export default function GeneratePage() {
     abortRef.current?.abort();
   }
 
-  async function generate() {
+  function sendToAnalyzer() {
+    try {
+      sessionStorage.setItem("analyzer.apiDocs", markdown);
+    } catch {
+      // storage unavailable — Copy button path still works
+    }
+  }
+
+  async function generate(override = false) {
     if (files.length === 0) {
       setError("Add at least one source file first.");
       return;
@@ -240,7 +250,24 @@ export default function GeneratePage() {
       setError(`Duplicate filenames: ${[...new Set(dupes)].join(", ")}. Rename or remove duplicates.`);
       return;
     }
-    const INJECTION_CLIENT = /(ignore (all )?previous instructions|you are now|disregard (all )?(prior|previous)|jailbreak|reveal .*(key|prompt|secret))/i;
+    // Strict completeness pre-check (mirrors server gate): block when required
+    // parts are missing instead of generating misleading docs — unless the
+    // user has explicitly chosen Continue on the blocked panel.
+    const { analyzeFiles, completenessGate } = await import("@/lib/code-context");
+    const gate = completenessGate(
+      analyzeFiles(files),
+      files.map((f) => ({ name: f.name, content: f.content }))
+    );
+    if (!gate.ok && !override) {
+      setBlocked({
+        reason: gate.reason,
+        missing: gate.missing,
+        requiredFiles: gate.recommended,
+      });
+      setError(null);
+      return;
+    }
+    const INJECTION_CLIENT = /(ignore (all )?previous instructions|you are now an? (ai|assistant|system|developer|root|admin)|disregard (all )?(prior|previous) (instructions|prompt)|jailbreak|forget (all |your )?instructions|new instructions:|reveal (the |your )?(system prompt|api key|secret key)|output (the |your )?system prompt|bypass (all |your )?safety|disable (all |your )?(safety|guardrails|filters))/i;
     const injected = files.filter((f) => INJECTION_CLIENT.test(f.content) || INJECTION_CLIENT.test(f.name)).map((f) => f.name);
     if (injected.length > 0) {
       setError(`Blocked instruction-override text in: ${injected.join(", ")}. Remove it before generating.`);
@@ -258,6 +285,7 @@ export default function GeneratePage() {
     }
     setLoading(true);
     setError(null);
+    setBlocked(null);
     setCopied(false);
     setStopped(false);
     stoppedRef.current = false;
@@ -276,10 +304,11 @@ export default function GeneratePage() {
         body: JSON.stringify({
           projectName: projectDesc ? `${projectName} — ${projectDesc}` : projectName,
           files: files.map((f) => ({ name: f.name, role: f.role, content: f.content.slice(0, MAX_FILE_CHARS) })),
+          allowIncomplete: override,
         }),
         signal: controller.signal,
       });
-      let data: { markdown?: string; warnings?: string[]; completeness?: Completeness; error?: string };
+      let data: { markdown?: string; warnings?: string[]; completeness?: Completeness; error?: string; reason?: string; incomplete?: boolean; missing?: string[]; requiredFiles?: string[]; recommendedFiles?: string[]; generatedFromIncomplete?: boolean };
       try {
         data = await res.json();
       } catch {
@@ -287,7 +316,20 @@ export default function GeneratePage() {
         return;
       }
       if (!res.ok) {
-        setError(data.error ?? "Generation failed.");
+        if (res.status === 422 || data.incomplete) {
+          // Backend-enforced block: no docs generated. Show structured warning.
+          setBlocked({
+            reason: data.reason ?? data.error ?? "Submission incomplete.",
+            missing: data.missing ?? [],
+            requiredFiles: data.requiredFiles ?? data.recommendedFiles ?? [],
+          });
+          setError(null);
+          if (data.requiredFiles ?? data.recommendedFiles) {
+            setWarnings((data.requiredFiles ?? data.recommendedFiles ?? []).map((r) => `Still needed: ${r}`));
+          }
+        } else {
+          setError(data.error ?? "Generation failed.");
+        }
         return;
       }
       if (!data.markdown) {
@@ -419,7 +461,7 @@ export default function GeneratePage() {
         )}
 
         <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
-          <button type="button" onClick={generate} disabled={loading || !valid} style={{ ...primaryBtn, opacity: loading || !valid ? 0.5 : 1 }}>
+          <button type="button" onClick={() => generate(false)} disabled={loading || !valid} style={{ ...primaryBtn, opacity: loading || !valid ? 0.5 : 1 }}>
             {loading ? "Analyzing…" : completeness ? "Re-analyze with all files" : "Analyze & Generate Documentation"}
           </button>
           {loading && (
@@ -431,6 +473,61 @@ export default function GeneratePage() {
         {!valid && <p style={{ color: MUTED }}>Add at least one file with source code to enable generation.</p>}
         {loading && <p style={{ color: INK }}>Classifying files, evaluating completeness, generating docs…</p>}
         {stopped && !loading && <p style={{ color: MUTED }}>Generation stopped.</p>}
+        {blocked && !loading && (
+          <div
+            role="alert"
+            style={{
+              marginTop: 12,
+              border: "2px solid #c00",
+              background: "#fdf0f1",
+              borderRadius: 10,
+              padding: 16,
+            }}
+          >
+            <h3 style={{ color: "#721c24", margin: "0 0 8px", fontSize: 16 }}>
+              Documentation Generation Blocked — Incomplete Source Code
+            </h3>
+            <p style={{ color: "#721c24", margin: "0 0 8px" }}>
+              We couldn&apos;t generate your API documentation because the submitted source code is incomplete.
+              Some essential files or information are missing, so generating documentation now could produce
+              inaccurate API specifications. No documentation was generated.
+            </p>
+            <p style={{ color: INK, margin: "8px 0 4px" }}>
+              <strong>Reason:</strong> {blocked.reason}
+            </p>
+            {blocked.missing.length > 0 && (
+              <>
+                <p style={{ color: INK, margin: "8px 0 4px" }}><strong>Missing information:</strong></p>
+                <ul style={{ color: INK, paddingLeft: 20, margin: "0 0 8px" }}>
+                  {blocked.missing.map((m, i) => (
+                    <li key={i}>{m}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {blocked.requiredFiles.length > 0 && (
+              <>
+                <p style={{ color: INK, margin: "8px 0 4px" }}><strong>Required files:</strong></p>
+                <ul style={{ color: INK, paddingLeft: 20, margin: "0 0 8px" }}>
+                  {blocked.requiredFiles.map((r, i) => (
+                    <li key={i}>{r}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+            <p style={{ color: MUTED, fontSize: 13, margin: "8px 0 0" }}>
+              Add the missing file(s) above — your current files are kept — then validate again.
+            </p>
+            <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+              <button type="button" onClick={() => generate(true)} disabled={loading} style={{ ...secondaryBtn, opacity: loading ? 0.5 : 1 }}>
+                Continue anyway — generate from incomplete context
+              </button>
+            </div>
+            <p style={{ color: MUTED, fontSize: 12, margin: "6px 0 0" }}>
+              Output will be marked as draft and may contain Unknown sections. Recommended only when the missing files aren&apos;t available.
+            </p>
+          </div>
+        )}
       </section>
 
       {/* B. Completeness report */}
@@ -542,9 +639,16 @@ export default function GeneratePage() {
               <button type="button" onClick={() => downloadText("api-docs.md", markdown)} style={primaryBtn}>
                 Download .md
               </button>
-              <button type="button" onClick={generate} disabled={loading} style={{ ...secondaryBtn, opacity: loading ? 0.5 : 1 }}>
+              <button type="button" onClick={() => generate(false)} disabled={loading} style={{ ...secondaryBtn, opacity: loading ? 0.5 : 1 }}>
                 Regenerate
               </button>
+              <Link
+                href="/"
+                onClick={sendToAnalyzer}
+                style={{ ...primaryBtn, textDecoration: "none", display: "inline-block" }}
+              >
+                Send to Impact Analyzer →
+              </Link>
             </div>
             <p style={{ color: MUTED, fontSize: 13 }}>
               Next: paste this Markdown into the <Link href="/" style={{ color: INK }}>Impact Analyzer</Link> as API documentation.

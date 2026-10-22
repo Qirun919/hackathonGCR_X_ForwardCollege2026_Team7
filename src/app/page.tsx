@@ -188,13 +188,29 @@ function TestCard({ t }: { t: TestCase }) {
 }
 
 export default function Home() {
-  const [docs, setDocs] = useState(() => DEMO_SCENARIOS[0].docs);
+  // One-click handoff: docs generated on /generate arrive via sessionStorage.
+  // Lazy initializer (not an effect) so no cascading render.
+  const [docs, setDocs] = useState(() => {
+    try {
+      const incoming = sessionStorage.getItem("analyzer.apiDocs");
+      sessionStorage.removeItem("analyzer.apiDocs");
+      if (incoming && incoming.trim().length >= 20) return incoming.slice(0, 60000);
+    } catch {
+      // storage unavailable — fall through to demo default
+    }
+    return DEMO_SCENARIOS[0].docs;
+  });
   const [change, setChange] = useState(() => DEMO_SCENARIOS[0].change);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<Report | null>(null);
   const [meta, setMeta] = useState<ApiMeta | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [codingPrompt, setCodingPrompt] = useState<string | null>(null);
+  const [promptLoading, setPromptLoading] = useState(false);
+  const [promptError, setPromptError] = useState<string | null>(null);
+  const [promptStale, setPromptStale] = useState(false);
   const [showAllTests, setShowAllTests] = useState(false);
   const [demoId, setDemoId] = useState<string>(DEMO_SCENARIOS[0].id);
   const [stopped, setStopped] = useState(false);
@@ -236,7 +252,8 @@ export default function Home() {
       setError("Change description is too short — describe what is changing.");
       return;
     }
-    const hasEndpoint = /^#{0,3}\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\/\S+/gim.test(docs);
+    const normalizedDocs = docs.replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/[—–]/g, "-");
+    const hasEndpoint = /^#{0,3}\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\/[^\s]*)\s*$/gim.test(normalizedDocs);
     const pathCount = docs.match(/\/[a-zA-Z0-9_{}-]+(?:\/[a-zA-Z0-9_{}.-]+)+/g)?.length ?? 0;
     if (!hasEndpoint && pathCount < 2) {
       setError("This doesn't look like API documentation — no endpoints or paths detected. Paste docs with lines like 'GET /tasks'.");
@@ -249,9 +266,13 @@ export default function Home() {
     setStopped(false);
     stoppedRef.current = false;
     // Clear the previous result immediately so a new request never
-    // shows stale findings while analyzing.
+    // shows stale findings while analyzing. Prompt is invalidated too.
     setReport(null);
     setMeta(null);
+    setCodingPrompt(null);
+    setPromptError(null);
+    setPromptStale(false);
+    setCopiedPrompt(false);
     const controller = new AbortController();
     abortRef.current = controller;
     const timeout = setTimeout(() => controller.abort(), 120000);
@@ -308,6 +329,45 @@ export default function Home() {
     }
   }
 
+  async function generatePrompt() {
+    if (!report || loading || promptLoading) return;
+    setPromptLoading(true);
+    setPromptError(null);
+    setCopiedPrompt(false);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120000);
+    try {
+      const res = await fetch("/api/analyze/coding-prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ report, changeDescription: change }),
+        signal: controller.signal,
+      });
+      let data: { prompt?: string; error?: string };
+      try {
+        data = await res.json();
+      } catch {
+        setPromptError("Server returned an unreadable response. Your workflow is unchanged — please retry.");
+        return;
+      }
+      if (!res.ok || !data.prompt) {
+        setPromptError(data.error ?? "Prompt generation failed. Your workflow is unchanged — please retry.");
+        return;
+      }
+      setCodingPrompt(data.prompt);
+      setPromptStale(false);
+    } catch (err) {
+      setPromptError(
+        err instanceof Error && err.name === "AbortError"
+          ? "Prompt request timed out. Your workflow is unchanged — please retry."
+          : "Network error. Your workflow is unchanged — please retry."
+      );
+    } finally {
+      clearTimeout(timeout);
+      setPromptLoading(false);
+    }
+  }
+
   function loadCached() {
     const mock = (window as unknown as { __mock?: Report }).__mock;
     if (mock) {
@@ -315,10 +375,19 @@ export default function Home() {
       setMeta({ model: "mock (cached demo)", mock: true });
       setError(null);
       setShowAllTests(false);
+      setCodingPrompt(null);
+      setPromptError(null);
+      setPromptStale(false);
+      setCopiedPrompt(false);
     }
   }
 
+  function markPromptStale() {
+    if (codingPrompt) setPromptStale(true);
+  }
+
   function loadDemo(id: string) {
+    markPromptStale();
     const scenario = DEMO_SCENARIOS.find((s) => s.id === id) ?? DEMO_SCENARIOS[0];
     setDocs(scenario.docs);
     setChange(scenario.change);
@@ -352,8 +421,32 @@ export default function Home() {
       <h1 style={{ color: INK }}>AI Change Impact Analyzer</h1>
       <p style={{ color: MUTED }}>
         Paste API docs, describe the change, get an evidence-linked impact report + regression plan.
-        {" "}Have raw code instead? <Link href="/generate" style={{ color: INK, fontWeight: 700 }}>Generate docs from source →</Link>
       </p>
+      <Link href="/generate" style={{ textDecoration: "none" }}>
+        <div
+          style={{
+            marginTop: 12,
+            background: "linear-gradient(135deg, #111111 0%, #2d2d2d 100%)",
+            color: "#ffffff",
+            borderRadius: 12,
+            padding: "16px 20px",
+            display: "flex",
+            gap: 12,
+            alignItems: "center",
+            cursor: "pointer",
+          }}
+        >
+          <span style={{ fontSize: 28 }}>📄</span>
+          <span>
+            <span style={{ display: "block", fontWeight: 800, fontSize: 16 }}>
+              Have raw backend code instead? Generate docs from source →
+            </span>
+            <span style={{ display: "block", fontSize: 13, opacity: 0.85, marginTop: 2 }}>
+              Code → Markdown API Docs: paste Express files, check completeness, export for this analyzer.
+            </span>
+          </span>
+        </div>
+      </Link>
 
       <section style={card}>
         <h2 style={{ color: INK, fontSize: 18, marginBottom: 12 }}>1. Input</h2>
@@ -362,7 +455,7 @@ export default function Home() {
         </label>
         <textarea
           value={docs}
-          onChange={(e) => setDocs(e.target.value)}
+          onChange={(e) => { setDocs(e.target.value); markPromptStale(); }}
           rows={10}
           style={inputStyle}
           placeholder="Paste API documentation here..."
@@ -387,7 +480,7 @@ export default function Home() {
           </label>
           <textarea
             value={change}
-            onChange={(e) => setChange(e.target.value)}
+            onChange={(e) => { setChange(e.target.value); markPromptStale(); }}
             rows={4}
             style={inputStyle}
             placeholder="Describe the API or feature change..."
@@ -484,8 +577,73 @@ export default function Home() {
               >
                 {copied ? "Copied!" : "Copy Markdown"}
               </button>
+              <button
+                type="button"
+                onClick={generatePrompt}
+                disabled={loading || promptLoading}
+                style={{ ...secondaryBtn, opacity: loading || promptLoading ? 0.5 : 1 }}
+                title="Convert this workflow into a prompt for an AI coding agent"
+              >
+                {promptLoading ? "Generating prompt…" : "Generate Coding Agent Prompt"}
+              </button>
             </div>
+            {promptError && (
+              <p style={{ color: "#721c24", marginTop: 8 }}>{promptError}</p>
+            )}
           </section>
+
+          {/* Coding agent prompt — separate result, workflow stays visible above/below */}
+          {(codingPrompt || promptLoading) && (
+            <section style={{ ...card, borderColor: "#9adbe8" }} aria-label="Coding agent prompt">
+              <h3 style={{ color: INK, marginBottom: 4 }}>
+                Coding Agent Prompt{" "}
+                {promptStale && (
+                  <span style={{ color: "#7a5b00", fontSize: 13 }}>(outdated — workflow changed)</span>
+                )}
+              </h3>
+              {promptLoading && !codingPrompt && (
+                <p style={{ color: INK }}>Generating prompt from the current workflow…</p>
+              )}
+              {codingPrompt && (
+                <>
+                  <pre style={{ whiteSpace: "pre-wrap", background: "#fafafa", border: "1px solid #e6e6e6", borderRadius: 8, padding: 12, fontSize: 13, color: INK, maxHeight: 480, overflowY: "auto" }}>
+                    {codingPrompt}
+                  </pre>
+                  <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      style={secondaryBtn}
+                      onClick={async () => {
+                        try {
+                          await navigator.clipboard.writeText(codingPrompt);
+                          setCopiedPrompt(true);
+                        } catch {
+                          setPromptError("Copy failed — select the text manually.");
+                        }
+                      }}
+                    >
+                      {copiedPrompt ? "Copied!" : "Copy Prompt"}
+                    </button>
+                    <button
+                      type="button"
+                      style={secondaryBtn}
+                      onClick={generatePrompt}
+                      disabled={loading || promptLoading}
+                    >
+                      Regenerate Prompt
+                    </button>
+                    <button
+                      type="button"
+                      style={secondaryBtn}
+                      onClick={() => { setCodingPrompt(null); setPromptError(null); setPromptStale(false); }}
+                    >
+                      Close
+                    </button>
+                  </div>
+                </>
+              )}
+            </section>
+          )}
 
           {/* B. Main findings */}
           <section style={card} aria-label="Main findings">

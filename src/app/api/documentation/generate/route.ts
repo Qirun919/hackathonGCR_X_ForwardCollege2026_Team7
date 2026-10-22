@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { generateDocsSchema } from "@/lib/doc-schema";
 import { MAX_TOTAL_CHARS } from "@/lib/code-docs";
-import { analyzeFiles, missingRequires } from "@/lib/code-context";
+import { analyzeFiles, completenessGate, missingRequires } from "@/lib/code-context";
 import { buildAnalysisMessages, buildAnalysisRepairMessages } from "@/lib/analysis-prompt";
 import { analysisSchema, type CodeAnalysis } from "@/lib/analysis-schema";
 import { renderMarkdown } from "@/lib/render-docs";
@@ -110,7 +110,10 @@ export async function POST(req: Request) {
 
   // --- Guardrail B: prompt-injection / instruction override in code or names. ---
   // Source is DATA, never instructions: block override attempts, including in comments.
-  const INJECTION = /(ignore (all )?previous instructions|system prompt|you are now|disregard (all )?(prior|previous)|jailbreak|do anything now|forget (all |your )?instructions|new instructions:|return .*password|reveal .*(key|prompt|secret)|output .*system)/i;
+  // NOTE: patterns are anchored to instruction phrasing so normal auth code
+  // (e.g. `return { password: hashed }`) does NOT trigger. A previous version
+  // used `return .*password` which false-positived on any password handling.
+  const INJECTION = /(ignore (all )?previous instructions|system prompt|you are now an? (ai|assistant|system|developer|root|admin)|disregard (all )?(prior|previous) (instructions|prompt)|jailbreak|do anything now|forget (all |your )?instructions|new instructions:|reveal (the |your )?(system prompt|api key|secret key)|output (the |your )?system prompt|bypass (all |your )?safety|disable (all |your )?(safety|guardrails|filters))/i;
   const injected = files.filter((f) => INJECTION.test(f.content) || INJECTION.test(f.name)).map((f) => f.name);
   if (injected.length > 0) {
     return NextResponse.json(
@@ -151,6 +154,34 @@ export async function POST(req: Request) {
   const suppliedNames = files.map((f) => f.name);
   const unmetRequires = missingRequires(signals, suppliedNames);
 
+  // --- Strict completeness gate (backend-enforced):
+  // block generation when required parts are missing, UNLESS the user has
+  // explicitly accepted the risk via allowIncomplete (Continue button).
+  // allowIncomplete only downgrades the gate to warnings — all other
+  // guardrails (size, secrets, injection, schema) still apply. ---
+  const gate = completenessGate(
+    signals,
+    files.map((f) => ({ name: f.name, content: f.content }))
+  );
+  const { allowIncomplete } = parsed.data;
+  const gateOverride = !gate.ok && allowIncomplete;
+  if (!gate.ok && !allowIncomplete) {
+    return NextResponse.json(
+      {
+        error: "Documentation Generation Blocked — Incomplete Source Code",
+        reason:
+          "We couldn't generate your API documentation because the submitted source code is incomplete. " +
+          "Some essential files or information are missing, so generating documentation now could produce inaccurate API specifications. " +
+          gate.reason,
+        missing: gate.missing,
+        requiredFiles: gate.recommended,
+        unresolvedImports: unmetRequires.slice(0, 10),
+        incomplete: true,
+      },
+      { status: 422 }
+    );
+  }
+
   try {
     // --- Pass 1 (AI): structured analysis JSON, validated. ---
     const analysis = await analyzeCode(files, projectName || "Unknown project", signals);
@@ -175,6 +206,11 @@ export async function POST(req: Request) {
     const warnings = [
       ...unmetRequires.map((r) => `Referenced but not supplied: ${r} — add the file for complete docs.`),
       ...conflictNote,
+      ...(gateOverride
+        ? [
+            `Generated from INCOMPLETE context at your request — treat as draft: ${gate.missing.join("; ")}. Still needed: ${gate.recommended.join("; ")}.`,
+          ]
+        : []),
     ];
     if (unmetRequires.length === 0 && analysis.recommendedFiles.length > 0) {
       warnings.push("Some details need more context — see completeness report for recommended files.");
@@ -184,6 +220,7 @@ export async function POST(req: Request) {
       markdown,
       warnings,
       completeness,
+      generatedFromIncomplete: gateOverride || undefined,
       meta: { files: files.length, chars: total },
     });
   } catch (err) {
@@ -196,7 +233,10 @@ export async function POST(req: Request) {
         const endpoints = analysis.endpoints;
         return NextResponse.json({
           markdown,
-          warnings: unmetRequires.map((r) => `Referenced but not supplied: ${r}.`),
+          warnings: [
+            ...unmetRequires.map((r) => `Referenced but not supplied: ${r}.`),
+            ...(gateOverride ? [`Generated from INCOMPLETE context at your request — treat as draft.`] : []),
+          ],
           completeness: {
             detectedComponents: signals2.map((s) => ({ file: s.name, kind: s.detectedKind })),
             totalEndpoints: endpoints.length,
@@ -206,6 +246,7 @@ export async function POST(req: Request) {
             missing: analysis.missing,
             recommendedFiles: analysis.recommendedFiles,
           },
+          generatedFromIncomplete: gateOverride || undefined,
           meta: { files: files.length, chars: total, retried: true },
         });
       } catch {

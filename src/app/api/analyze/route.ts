@@ -75,10 +75,16 @@ export async function POST(req: Request) {
   const rawChange = parsed.data.changeRequest;
 
   // --- Guardrail 1: reject non-API text (prose, essays, random paste).
-  // Accepts both plain "GET /tasks" and Markdown "## GET /tasks" headings
-  // (the latter is what the code-to-docs generator emits). ---
-  const endpointLike = rawDocs.match(/^#{0,3}\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\/\S+/gim) ?? [];
-  const pathLike = rawDocs.match(/\/[a-zA-Z0-9_{}-]+(?:\/[a-zA-Z0-9_{}.-]+)+/g) ?? [];
+  // Accepts both plain "GET /tasks" and Markdown "## GET /tasks" / "### GET /tasks"
+  // headings (the latter is what the code-to-docs generator emits).
+  // Normalizes smart quotes/dashes first so pasted docs with fancy
+  // punctuation don't fail matching. ---
+  const normalizedDocs = rawDocs
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[—–]/g, "-");
+  const endpointLike = normalizedDocs.match(/^#{0,3}\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\/[^\s]*)\s*$/gim) ?? [];
+  const pathLike = normalizedDocs.match(/\/[a-zA-Z0-9_{}-]+(?:\/[a-zA-Z0-9_{}.-]+)+/g) ?? [];
   if (endpointLike.length === 0 && pathLike.length < 2) {
     return NextResponse.json(
       {
@@ -90,7 +96,9 @@ export async function POST(req: Request) {
   }
 
   // --- Guardrail 2: reject prompt-injection / instruction-override attempts. ---
-  const INJECTION = /(ignore (all )?previous instructions|system prompt|you are now|disregard (all )?(prior|previous)|jailbreak|do anything now|return .*password|reveal .*key)/i;
+  // Anchored to instruction phrasing so normal code/docs mentioning
+  // passwords or keys do NOT trigger.
+  const INJECTION = /(ignore (all )?previous instructions|you are now an? (ai|assistant|system|developer|root|admin)|disregard (all )?(prior|previous) (instructions|prompt)|jailbreak|do anything now|forget (all |your )?instructions|new instructions:|reveal (the |your )?(system prompt|api key|secret key)|output (the |your )?system prompt|bypass (all |your )?safety|disable (all |your )?(safety|guardrails|filters))/i;
   if (INJECTION.test(rawDocs) || INJECTION.test(rawChange)) {
     return NextResponse.json(
       { error: "Input looks like an instruction override and was blocked. Describe the API change plainly instead." },
@@ -125,7 +133,7 @@ export async function POST(req: Request) {
     }
   }
 
-  const { text: docs, truncated: docsTruncated } = truncateDocs(rawDocs);
+  const { text: docs, truncated: docsTruncated } = truncateDocs(normalizedDocs);
   const { text: change, truncated: changeTruncated } = truncateChange(rawChange);
 
   try {
